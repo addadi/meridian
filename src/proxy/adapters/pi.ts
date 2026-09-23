@@ -21,10 +21,12 @@
  * - Manages its own tool execution loop: passthrough mode is appropriate
  * - No subagent routing: pi-coding-agent is single-agent (pylon adds orchestration on top)
  *
- * Detection: pi mimics Claude Code's User-Agent, so automatic detection is
- * unreliable. Use one of:
+ * Detection: pi 0.87+ sends its own User-Agent — `pi (<system>; <arch>)` —
+ * which detect.ts matches directly. Older pi (and forks like pylon/OMP)
+ * mimic Claude Code's `claude-cli/` User-Agent, so automatic detection is
+ * unreliable there; use one of:
  * - x-meridian-agent: pi header (per-request)
- * - MERIDIAN_DEFAULT_AGENT=pi env var (global default)
+ * - MERIDIAN_DEFAULT_AGENT=pi env var (resolves the claude-cli collision)
  */
 
 import type { Context } from "hono"
