@@ -121,10 +121,11 @@ function isLiteLLMRequest(c: Context): boolean {
  * 6. User-Agent starts with "opencode/"     → OpenCode adapter
  * 7. User-Agent starts with "factory-cli/"  → Droid adapter
  * 8. User-Agent starts with "Charm-Crush/"  → Crush adapter
- * 9. User-Agent starts with "claude-cli/"  → Claude Code adapter
- * 10. Polytoken UA ("Polytoken <v>" / "Polytoken/<v>") → Polytoken adapter
- * 11. litellm/* UA or x-litellm-* headers   → LiteLLM passthrough adapter
- * 12. Default                                → MERIDIAN_DEFAULT_AGENT env var, or OpenCode
+ * 9. User-Agent starts with "pi/" or "pi ("  → Pi adapter (pi 0.87+ own UA)
+ * 10. User-Agent starts with "claude-cli/"  → Claude Code adapter
+ * 11. Polytoken UA ("Polytoken <v>" / "Polytoken/<v>") → Polytoken adapter
+ * 12. litellm/* UA or x-litellm-* headers   → LiteLLM passthrough adapter
+ * 13. Default                                → MERIDIAN_DEFAULT_AGENT env var, or OpenCode
  */
 /**
  * Materialize an adapter INSTANCE (#476): the base adapter's behavior under
@@ -239,6 +240,22 @@ export function detectAdapter(c: Context): AgentAdapter {
   // clients that identify themselves unambiguously have had their say.
   if (c.req.header("x-session-affinity")) {
     return openCodeAdapter
+  }
+
+  // Pi's own User-Agent (0.87+): `pi (<system>; <arch>)`, or `pi/<version>`
+  // in older shapes. Pi stopped mimicking claude-cli/ in 0.87, so its
+  // traffic no longer matches the claude-cli rule below and fell through to
+  // the OpenCode default, applying OpenCode's transforms to pi requests.
+  // Verified live (2026-09-23, Claude Max account without Extra Usage
+  // headroom): a real pi 0.87 request (system prompt with pi's <docs> block,
+  // thinking enabled, tools) routed through the OpenCode adapter is refused
+  // upstream with "You're out of extra usage" (HTTP 400) on both the
+  // opus[1m] attempt and the plain opus fallback — surfacing to the user as
+  // a misleading billing_error — while the identical request under the pi
+  // adapter succeeds. Token-boundary match ("/" or whitespace+paren right
+  // after "pi") so "pixie/…" or "ping (…)" cannot match.
+  if (/^pi(?:\/|\s*\()/.test(userAgent)) {
+    return piAdapter
   }
 
   // Claude Code CLI — `claude-cli/<version>`. Pi (and downstream Pi-based

@@ -96,6 +96,40 @@ describe("detectAdapter — Claude Code detection", () => {
   })
 })
 
+describe("detectAdapter — Pi own-UA detection (0.87+)", () => {
+  it("returns piAdapter for pi 0.87's real UA shape", () => {
+    expect(detectAdapter(makeContext("pi (linux 7.2.3-arch1-3; x64)")).name).toBe("pi")
+    expect(detectAdapter(makeContext("pi (darwin 25.0.0; arm64)")).name).toBe("pi")
+  })
+
+  it("returns piAdapter for the pi/<version> UA shape", () => {
+    expect(detectAdapter(makeContext("pi/0.87.1")).name).toBe("pi")
+    expect(detectAdapter(makeContext("pi/0.92.0-beta.3")).name).toBe("pi")
+  })
+
+  it("does not match longer client names that merely start with 'pi'", () => {
+    // Token boundary: needs "/" or whitespace+"(" immediately after "pi".
+    expect(detectAdapter(makeContext("pixie/1.0.0")).name).toBe("opencode")
+    expect(detectAdapter(makeContext("ping (monitor)")).name).toBe("opencode")
+    expect(detectAdapter(makeContext("pip/24.0")).name).toBe("opencode")
+  })
+
+  it("does not shadow the claude-cli rule or its env tiebreaker", () => {
+    expect(detectAdapter(makeContext("claude-cli/2.0.0")).name).toBe("claude-code")
+    process.env.MERIDIAN_DEFAULT_AGENT = "pi"
+    try {
+      expect(detectAdapter(makeContext("claude-cli/2.0.0")).name).toBe("pi")
+    } finally {
+      delete process.env.MERIDIAN_DEFAULT_AGENT
+    }
+  })
+
+  it("explicit x-meridian-agent still wins over the pi UA", () => {
+    const adapter = detectAdapter(makeContext("pi (linux; x64)", { "x-meridian-agent": "opencode" }))
+    expect(adapter).toBe(openCodeAdapter)
+  })
+})
+
 describe("detectAdapter — claude-cli + MERIDIAN_DEFAULT_AGENT tiebreaker", () => {
   // Pi (and downstream Pi-based harnesses like pylon) ship with a User-Agent
   // of `claude-cli/<version>`. When the operator has explicitly set
