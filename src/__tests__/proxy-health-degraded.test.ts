@@ -24,8 +24,12 @@ mock.module("../proxy/models", () => ({
     return "sonnet"
   },
   getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
-  hasExtendedContext: () => false,
-  stripExtendedContext: (m: string) => m,
+  // Faithful to the real implementation — see profile-switch-inflight.test.ts;
+  // a bare `() => false` leaks into replay-budget.test.ts via bun's
+  // process-global mock.module. This mock's mapModelToClaudeModel never
+  // returns a [1m] variant, so the faithful answer changes nothing here.
+  hasExtendedContext: (model: string) => model.endsWith("[1m]"),
+  stripExtendedContext: (model: string) => model.replace("[1m]", ""),
   isClosedControllerError: (e: unknown) => e instanceof Error && e.message.includes("controller is closed"),
   recordExtendedContextUnavailable: () => {},
   isExtendedContextKnownUnavailable: () => false,
