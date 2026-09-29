@@ -16,6 +16,23 @@ import {
 } from "node:fs/promises"
 import { hostname } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
+import { setTimeout as waitForLockRetry } from "node:timers/promises"
+import { lifecycleLockQueue } from "./session/lifecycleLockQueue"
+import {
+  SessionLifecycleError,
+  SessionLifecycleLockError,
+  SessionLifecycleCorruptError,
+  SessionLifecycleBacklogError,
+} from "./session/lifecycleErrors"
+export {
+  SessionLifecycleError,
+  SessionLifecycleLockError,
+  SessionLifecycleCorruptError,
+  SessionLifecycleBacklogError,
+  SessionLifecycleQueueCapacityError,
+  SessionLifecycleQueueStalledError,
+  SessionLifecycleReentrancyError,
+} from "./session/lifecycleErrors"
 import { getMaxStoredSessionsLimit, getSessionStoreDir } from "./sessionStore"
 import {
   directoryRenameWasBlocked,
@@ -33,6 +50,7 @@ import {
   captureProcessIncarnation,
   parseProcessIncarnation,
   processIncarnationIsDead,
+  processIncarnationPredatesBoot,
   processIncarnationProbeBudgetMs,
   type ProcessIncarnation,
 } from "./session/processIncarnation"
@@ -109,6 +127,8 @@ interface SessionGcSidecar {
 export type SessionDeleter = (locator: TranscriptLocator) => Promise<void>
 
 export interface SessionLifecycleOptions {
+  /** Cancel queued/external-lock admission only, never a running durable transaction. */
+  admissionSignal?: AbortSignal
   /** Test seam. Production callers should use getSessionStoreDir(). */
   storeDir?: string
   deleter?: SessionDeleter
@@ -158,11 +178,6 @@ export interface GcResult {
   failed: number
   deferred: number
 }
-
-export class SessionLifecycleError extends Error {}
-export class SessionLifecycleLockError extends SessionLifecycleError {}
-export class SessionLifecycleCorruptError extends SessionLifecycleError {}
-export class SessionLifecycleBacklogError extends SessionLifecycleError {}
 
 /** Stable ownership key. The separator prevents ambiguous concatenation. */
 export function getTranscriptResourceKey(locator: TranscriptLocator): string {
@@ -265,6 +280,42 @@ export async function releaseActiveTranscriptLease(
   })
 }
 
+/** Joined writers' leases whose release met a busy lock, by store directory. */
+const deferredLeaseReleases = new Map<string, Map<string, ActiveTranscriptLease>>()
+
+/**
+ * Release the lease of a writer that has already been joined.
+ *
+ * Once the writer has exited, only the bookkeeping is late, so a busy lock must
+ * not fail the finished turn. Throwing also stranded the lease: an armed win32
+ * lease outlives its owner until the host reboots, so its transcript could not
+ * be leased or collected and it held a retirement-backlog slot all that time.
+ * The next GC sweep, including the one at shutdown, retries the release.
+ */
+export async function releaseJoinedTranscriptLease(
+  lease: ActiveTranscriptLease,
+  options: SessionLifecycleOptions = {},
+): Promise<void> {
+  try {
+    await releaseActiveTranscriptLease(lease, options)
+  } catch (error) {
+    if (!(error instanceof SessionLifecycleLockError)) throw error
+    const storeDir = getStoreDir(options)
+    let pending = deferredLeaseReleases.get(storeDir)
+    if (!pending) deferredLeaseReleases.set(storeDir, pending = new Map())
+    pending.set(lease.token, lease)
+  }
+}
+
+async function retryDeferredLeaseReleases(options: SessionLifecycleOptions): Promise<void> {
+  const pending = deferredLeaseReleases.get(getStoreDir(options))
+  if (!pending) return
+  for (const lease of pending.values()) {
+    await releaseActiveTranscriptLease(lease, options)
+    pending.delete(lease.token)
+  }
+}
+
 /** Persist ownership before the SDK process which can create the transcript starts. */
 export async function prepareFork(
   locator: TranscriptLocator,
@@ -307,8 +358,9 @@ async function prepareForkIntent(
       Object.assign(locator, exactLocator(existing))
       return exactLocator(existing)
     }
-    assertResourceCapacity(sidecar, options, "prepared")
     const now = nowMs(options)
+    deferRetirementForAdmission(sidecar, options, now)
+    assertResourceCapacity(sidecar, options, "prepared")
     const resource: TranscriptResource = {
       key,
       generation: allocateLifecycleGeneration(sidecar, key),
@@ -588,9 +640,9 @@ export async function reconcile(
 ): Promise<ReconcileResult> {
   // Validate caller pins before waiting for the lock. The authoritative pin
   // provider is refreshed again while the lifecycle lock is held.
-  pins.map(canonicalizeTranscriptLocator)
+  indexPins(pins)
   return withSidecarLock(options, async (paths) => {
-    const effectivePins = (options.pinProvider?.() ?? pins).map(canonicalizeTranscriptLocator)
+    const effectivePins = indexPins(options.pinProvider?.() ?? pins)
     const sidecar = await readSidecar(paths.sidecar)
     const pinKeys = new Set(Object.values(sidecar.resources)
       .filter((resource) => resourceIsPinned(resource, effectivePins))
@@ -695,13 +747,17 @@ export async function reconcile(
   })
 }
 
-/** Delete a bounded batch of unpinned retired transcripts through the supported SDK API. */
+/**
+ * Delete a bounded batch of unpinned retired transcripts through the supported
+ * SDK API, after retrying deferred lease releases that would otherwise fence them.
+ */
 export async function runGc(
   pins: readonly TranscriptLocator[],
   options: SessionLifecycleOptions = {},
 ): Promise<GcResult> {
+  await retryDeferredLeaseReleases(options)
   await reconcile(pins, options)
-  let currentPins = pins.map(canonicalizeTranscriptLocator)
+  let currentPins = indexPins(pins)
   const limit = option(options.maxDeletesPerRun, DEFAULT_MAX_DELETES, "maxDeletesPerRun")
   const result: GcResult = { deleted: 0, notFound: 0, failed: 0, deferred: 0 }
   const runTimeoutMs = option(options.runTimeoutMs, DEFAULT_DELETE_TIMEOUT_MS, "runTimeoutMs")
@@ -711,7 +767,7 @@ export async function runGc(
     if (Date.now() >= deadline) break
     const refreshedPins = options.pinProvider?.()
     if (refreshedPins) {
-      currentPins = refreshedPins.map(canonicalizeTranscriptLocator)
+      currentPins = indexPins(refreshedPins)
     }
     const candidate = await claimDeletion(currentPins, options)
     if (!candidate) break
@@ -766,12 +822,13 @@ export async function runGc(
 }
 
 async function claimDeletion(
-  pins: readonly TranscriptLocator[],
+  pins: PinIndex,
   options: SessionLifecycleOptions,
 ): Promise<TranscriptResource | undefined> {
   return withSidecarLock(options, async (paths) => {
     const sidecar = await readSidecar(paths.sidecar)
-    const finalPins = (options.pinProvider?.() ?? pins).map(canonicalizeTranscriptLocator)
+    const refreshedPins = options.pinProvider?.()
+    const finalPins = refreshedPins ? indexPins(refreshedPins) : pins
     const now = nowMs(options)
     const unarmedLeaseTtlMs = nonNegativeOption(options.unarmedLeaseTtlMs, DEFAULT_UNARMED_LEASE_TTL_MS, "unarmedLeaseTtlMs")
     let leasesChanged = false
@@ -859,7 +916,7 @@ async function finishDeletion(
 }
 
 async function countDeferred(
-  pins: readonly TranscriptLocator[],
+  pins: PinIndex,
   options: SessionLifecycleOptions,
 ): Promise<number> {
   return withSidecarLock(options, async (paths) => {
@@ -1149,8 +1206,37 @@ interface SidecarPaths {
   lock: string
 }
 
-async function publishInitializedSidecarLock(path: string, contents: string): Promise<boolean> {
+interface SidecarLockCandidate {
+  /** Become the lock. False means somebody else already holds it. */
+  publish: () => Promise<boolean>
+  /** Drop the staging name. A published candidate stays alive as the lock. */
+  discard: () => Promise<void>
+}
+
+/** Initialise one lock candidate for a whole acquisition, not one per attempt.
+ *
+ *  The fsync itself is load-bearing: a crash that leaves the lock linked to an
+ *  unwritten inode is unrecoverable, because stale-lock recovery only retires a
+ *  lock whose owner it can parse and prove dead. Paying it per attempt is what
+ *  does not follow. An fsync costs ~100ms on a busy filesystem, so a 2s budget
+ *  bought ~13 attempts rather than the ~80 a 25ms retry interval implies, and
+ *  each one wrote into the very directory the holder must fsync to publish the
+ *  sidecar, so waiters taxed the holder they were waiting for. One initialised
+ *  inode, re-linked, keeps the durability and drops the cost to a rename-class
+ *  metadata operation.
+ */
+export async function createInitializedSidecarLockCandidate(
+  path: string,
+  contents: string,
+): Promise<SidecarLockCandidate> {
   const staging = `${path}.candidate-${process.pid}-${randomUUID()}`
+  const discard = async (): Promise<void> => {
+    await unlink(staging).catch((error) => {
+      if (!hasCode(error, "ENOENT")) {
+        console.error("[sessionLifecycle] lock staging cleanup failed:", errorMessage(error))
+      }
+    })
+  }
   let handle: Awaited<ReturnType<typeof open>> | undefined
   try {
     handle = await open(staging, "wx", 0o600)
@@ -1158,20 +1244,22 @@ async function publishInitializedSidecarLock(path: string, contents: string): Pr
     await handle.sync()
     await handle.close()
     handle = undefined
-    try {
-      await link(staging, path)
-      return true
-    } catch (error) {
-      if (hasCode(error, "EEXIST")) return false
-      throw error
-    }
-  } finally {
+  } catch (error) {
     await handle?.close().catch(() => undefined)
-    await unlink(staging).catch((error) => {
-      if (!hasCode(error, "ENOENT")) {
-        console.error("[sessionLifecycle] lock staging cleanup failed:", errorMessage(error))
+    await discard()
+    throw error
+  }
+  return {
+    publish: async () => {
+      try {
+        await link(staging, path)
+        return true
+      } catch (error) {
+        if (hasCode(error, "EEXIST")) return false
+        throw error
       }
-    })
+    },
+    discard,
   }
 }
 
@@ -1180,42 +1268,58 @@ async function withSidecarLock<T>(
   operation: (paths: SidecarPaths) => Promise<T>,
 ): Promise<T> {
   const dir = getStoreDir(options)
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  await chmod(dir, 0o700)
   const paths = { sidecar: join(dir, SIDECAR_NAME), lock: join(dir, `${SIDECAR_NAME}.lock`) }
-  const incarnation = captureProcessIncarnation()
-  if (!incarnation) throw new SessionLifecycleLockError("cannot capture lock owner process incarnation")
-  const token = JSON.stringify({ pid: process.pid, hostname: hostname(), token: randomUUID(), incarnation })
-  const deadline = Date.now() + nonNegativeOption(options.lockWaitMs, DEFAULT_LOCK_WAIT_MS, "lockWaitMs")
-  const retryMs = option(options.lockRetryMs, DEFAULT_LOCK_RETRY_MS, "lockRetryMs")
-  const staleMs = option(options.lockStaleMs, DEFAULT_LOCK_STALE_MS, "lockStaleMs")
-  let acquired = false
-
-  while (!acquired) {
-    acquired = await publishInitializedSidecarLock(paths.lock, `${token}
-${Date.now()}
-`)
-    if (acquired) break
-    await recoverStaleLock(paths.lock, staleMs)
-    if (Date.now() >= deadline) {
-      throw new SessionLifecycleLockError(`timed out waiting for ${paths.lock}`)
-    }
-    await delay(Math.min(retryMs, Math.max(1, deadline - Date.now())))
-  }
-
-  try {
-    return await operation(paths)
-  } finally {
-    // Only the owner may release. A stale-lock recovery must not unlink a successor.
+  return lifecycleLockQueue.run(paths.lock, options.admissionSignal, async () => {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    await chmod(dir, 0o700)
+    options.admissionSignal?.throwIfAborted()
+    const incarnation = captureProcessIncarnation()
+    if (!incarnation) throw new SessionLifecycleLockError("cannot capture lock owner process incarnation")
+    const token = JSON.stringify({ pid: process.pid, hostname: hostname(), token: randomUUID(), incarnation })
+    const deadline = performance.now() + nonNegativeOption(options.lockWaitMs, DEFAULT_LOCK_WAIT_MS, "lockWaitMs")
+    const retryMs = option(options.lockRetryMs, DEFAULT_LOCK_RETRY_MS, "lockRetryMs")
+    const staleMs = option(options.lockStaleMs, DEFAULT_LOCK_STALE_MS, "lockStaleMs")
+    // Only the local head creates a durable candidate; local backlog consumes
+    // neither the external acquisition budget nor candidate-file I/O.
+    const candidate = await createInitializedSidecarLockCandidate(
+      paths.lock,
+      `${token}\n${Date.now()}\n`,
+    )
+    let acquired = false
     try {
-      const contents = await readFile(paths.lock, "utf8")
-      if (contents.startsWith(`${token}\n`)) await unlink(paths.lock)
-    } catch (error) {
-      if (!hasCode(error, "ENOENT")) {
-        console.error("[sessionLifecycle] lock release failed:", errorMessage(error))
+      try {
+        while (!acquired) {
+          options.admissionSignal?.throwIfAborted()
+          acquired = await candidate.publish()
+          if (acquired) break
+          await recoverStaleLock(paths.lock, staleMs)
+          options.admissionSignal?.throwIfAborted()
+          if (performance.now() >= deadline) {
+            throw new SessionLifecycleLockError(`timed out waiting for ${paths.lock}`)
+          }
+          await waitForLockRetry(Math.min(retryMs, Math.max(1, deadline - performance.now())), undefined, {
+            signal: options.admissionSignal,
+          })
+        }
+      } finally {
+        await candidate.discard()
+      }
+      options.admissionSignal?.throwIfAborted()
+      return await operation(paths)
+    } finally {
+      // Only the owner may release. A stale-lock recovery must not unlink a successor.
+      try {
+        if (acquired) {
+          const contents = await readFile(paths.lock, "utf8")
+          if (contents.startsWith(`${token}\n`)) await unlink(paths.lock)
+        }
+      } catch (error) {
+        if (!hasCode(error, "ENOENT")) {
+          console.error("[sessionLifecycle] lock release failed:", errorMessage(error))
+        }
       }
     }
-  }
+  })
 }
 
 interface CanonicalLifecycleLockOwner {
@@ -1656,15 +1760,34 @@ function assertResourceCapacity(
   }
 }
 
-function resourceIsPinned(
-  resource: TranscriptResource,
-  pins: readonly TranscriptLocator[],
-): boolean {
-  return pins.some((pin) =>
-    getTranscriptResourceKey(pin) === resource.key
+/** Pinned resource keys, each with the lifecycle generations its pins name. */
+type PinIndex = ReadonlyMap<string, ReadonlySet<string | undefined>>
+
+/**
+ * Canonicalise and hash every pin once. Matching resources against the raw pin
+ * list rehashed each pin for each resource: with ~1,400 resources and ~800 pins
+ * that is over a million SHA-256 digests, which kept every sweep inside the
+ * lifecycle lock for more than a second and starved all other requests.
+ */
+function indexPins(pins: readonly TranscriptLocator[]): PinIndex {
+  const realpaths = new Map<string, string>()
+  const index = new Map<string, Set<string | undefined>>()
+  for (const pin of pins) {
+    const canonical = canonicalizeLocator(pin, realpaths)
+    const key = getTranscriptResourceKey(canonical)
+    let generations = index.get(key)
+    if (!generations) index.set(key, generations = new Set())
+    generations.add(canonical.lifecycleGeneration)
+  }
+  return index
+}
+
+function resourceIsPinned(resource: TranscriptResource, pins: PinIndex): boolean {
+  const generations = pins.get(resource.key)
+  return generations !== undefined
     // Legacy mappings conservatively pin the physical locator until their
     // first exact-CAS lifecycle attachment stores a generation.
-    && (pin.lifecycleGeneration === undefined || pin.lifecycleGeneration === resource.generation))
+    && (generations.has(undefined) || generations.has(resource.generation))
 }
 
 function hasActiveTranscriptLease(resource: TranscriptResource): boolean {
@@ -1687,16 +1810,21 @@ function pruneDeadActiveLeases(resource: TranscriptResource, now: number, unarme
   if (!resource.activeLeases) return false
   let changed = false
   for (const [token, lease] of Object.entries(resource.activeLeases)) {
-    const executorDead = lease.executor && lease.executorRecoverable !== false
-      ? processIncarnationIsDead(lease.executor)
+    // An executor whose death cannot prove its descendants gone (win32) is
+    // still provably gone, with them, once the host has rebooted.
+    const executorDead = lease.executor
+      ? lease.executorRecoverable === false
+        ? processIncarnationPredatesBoot(lease.executor)
+        : processIncarnationIsDead(lease.executor)
       : false
     // An unarmed lease cannot have started a physical writer: production opens
     // the SDK gate only after attachActiveTranscriptExecutor commits. The TTL is
     // sized by the turn watchdog, so one that outlives it with its owner still
     // alive can only be a release that failed — collect it by age instead of
-    // fencing the conversation until restart.
-    const unarmedOwnerDead = !lease.executor && processIncarnationIsDead(lease.owner)
+    // fencing the conversation until restart. Age is checked first because an
+    // owner probe can spawn a process.
     const unarmedLeaseExpired = !lease.executor && now - lease.createdAt > unarmedLeaseTtlMs
+    const unarmedOwnerDead = !lease.executor && !unarmedLeaseExpired && processIncarnationIsDead(lease.owner)
     if (!executorDead && !unarmedOwnerDead && !unarmedLeaseExpired) continue
     delete resource.activeLeases[token]
     changed = true
@@ -1711,6 +1839,38 @@ function pendingResourceCount(sidecar: SessionGcSidecar): number {
     || resource.state === "retired"
     || resource.state === "deleting"
   ).length
+}
+
+/**
+ * A request's preallocation outranks transcript cleanup. Passive retirement
+ * fills the pending budget up to one free slot, and every in-flight turn holds
+ * a prepared slot until it publishes, so a strict budget would refuse
+ * concurrent turns whenever deletion lags behind retirement. A retired
+ * transcript that no deletion has claimed is merely waiting for cleanup:
+ * returning the newest one to live only postpones its deletion until reconcile
+ * finds room again, while the oldest keep their place at the head of the
+ * deletion queue. Admission is refused only when the whole budget is in-flight
+ * preparations and deletions.
+ */
+function deferRetirementForAdmission(
+  sidecar: SessionGcSidecar,
+  options: SessionLifecycleOptions,
+  now: number,
+): void {
+  const maximum = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
+  let excess = pendingResourceCount(sidecar) - maximum + 1
+  if (excess <= 0) return
+  const newestRetired = Object.values(sidecar.resources)
+    .filter((resource) => resource.state === "retired")
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.key.localeCompare(right.key))
+  for (const resource of newestRetired) {
+    if (excess <= 0) return
+    resource.state = "live"
+    resource.updatedAt = now
+    delete resource.nextAttemptAt
+    delete resource.lastError
+    excess--
+  }
 }
 
 function assertPendingCapacity(
@@ -1731,22 +1891,35 @@ function pruneTombstones(sidecar: SessionGcSidecar, options: SessionLifecycleOpt
   for (const resource of tombstones.slice(maximum)) delete sidecar.resources[resource.key]
 }
 
-function canonicalLocatorPath(path: string): string {
+function canonicalLocatorPath(path: string, realpaths: Map<string, string> | undefined): string {
   const lexical = resolve(path)
+  const known = realpaths?.get(lexical)
+  if (known !== undefined) return known
+  let canonical: string
   try {
-    return realpathSync.native(lexical)
+    canonical = realpathSync.native(lexical)
   } catch (error) {
-    if (hasCode(error, "ENOENT")) return lexical
-    throw error
+    if (!hasCode(error, "ENOENT")) throw error
+    canonical = lexical
   }
+  realpaths?.set(lexical, canonical)
+  return canonical
 }
 
 export function canonicalizeTranscriptLocator(locator: TranscriptLocator): TranscriptLocator {
+  return canonicalizeLocator(locator, undefined)
+}
+
+/** `realpaths` memoises resolution across one batch; its pins share a few directories. */
+function canonicalizeLocator(
+  locator: TranscriptLocator,
+  realpaths: Map<string, string> | undefined,
+): TranscriptLocator {
   validateLocator(locator)
   return {
     sessionId: locator.sessionId,
-    configDir: canonicalLocatorPath(locator.configDir),
-    ...(locator.projectDir ? { projectDir: canonicalLocatorPath(locator.projectDir) } : {}),
+    configDir: canonicalLocatorPath(locator.configDir, realpaths),
+    ...(locator.projectDir ? { projectDir: canonicalLocatorPath(locator.projectDir, realpaths) } : {}),
     ...(locator.lifecycleGeneration ? { lifecycleGeneration: locator.lifecycleGeneration } : {}),
   }
 }

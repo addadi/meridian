@@ -23,6 +23,7 @@ import {
   attachPinnedTranscript,
   clipChildOutput,
   commitFork,
+  createInitializedSidecarLockCandidate,
   getSessionGcNodeExecutable,
   getTranscriptResourceKey,
   prepareFork,
@@ -31,6 +32,7 @@ import {
   reconcile,
   registerLiveTranscript,
   releaseActiveTranscriptLease,
+  releaseJoinedTranscriptLease,
   runGc,
   type SessionLifecycleOptions,
   type TranscriptLocator,
@@ -58,6 +60,7 @@ interface StoredResource {
   deletionOwner?: ProcessIncarnation
   deletionExecutor?: ProcessIncarnation
   deletionProcessGroupId?: number
+  activeLeases?: Record<string, unknown>
 }
 
 interface StoredSidecar {
@@ -302,7 +305,7 @@ describe("session transcript lifecycle", () => {
     expect(deleted).not.toContain(active.sessionId)
   })
 
-  it("does not overbook reserved capacity when two publication requests race", async () => {
+  it("defers retirement instead of refusing racing publications, without overbooking", async () => {
     const bounded = { ...options, maxPending: 2 }
     for (const id of ["stale-a", "stale-b"]) await registerLiveTranscript(locator(id), bounded)
     await reconcile([], bounded)
@@ -310,12 +313,48 @@ describe("session transcript lifecycle", () => {
       prepareForkForPublication(locator("racing-a"), bounded),
       prepareForkForPublication(locator("racing-b"), bounded),
     ])
+    expect(attempts.filter(result => result.status === "fulfilled")).toHaveLength(2)
+    const resources = Object.values(readSidecar(storeDir).resources)
+    expect(resources.filter(resource => resource.state === "prepared")).toHaveLength(2)
+    expect(resources.filter(resource => ["retired", "deleting"].includes(resource.state))).toHaveLength(0)
+    expect(resources.filter(resource => resource.state === "live")).toHaveLength(2)
+  })
+
+  it("still refuses a publication when the whole backlog is in-flight work", async () => {
+    const bounded = { ...options, maxPending: 2 }
+    await prepareForkForPublication(locator("in-flight-a"), bounded)
+    const attempts = await Promise.allSettled([
+      prepareForkForPublication(locator("in-flight-b"), bounded),
+      prepareForkForPublication(locator("in-flight-c"), bounded),
+    ])
     expect(attempts.filter(result => result.status === "fulfilled")).toHaveLength(1)
     const failures = attempts.filter(result => result.status === "rejected")
     expect(failures).toHaveLength(1)
     expect(failures[0]?.reason).toBeInstanceOf(SessionLifecycleBacklogError)
     const resources = Object.values(readSidecar(storeDir).resources)
-    expect(resources.filter(resource => ["prepared", "retired", "deleting"].includes(resource.state))).toHaveLength(2)
+    expect(resources.filter(resource => resource.state === "prepared")).toHaveLength(2)
+  })
+
+  it("defers the newest retirement so the deletion queue keeps its oldest head", async () => {
+    const deleted: string[] = []
+    const bounded = { ...options, maxPending: 3, maxDeletesPerRun: 1,
+      deleter: async (resource: TranscriptLocator) => { deleted.push(resource.sessionId) } }
+    await registerLiveTranscript(locator("retired-oldest"), bounded)
+    await reconcile([], bounded)
+    now += 1_000
+    await registerLiveTranscript(locator("retired-newest"), bounded)
+    await reconcile([], bounded)
+    await prepareForkForPublication(locator("admitted-a"), bounded)
+    await prepareForkForPublication(locator("admitted-b"), bounded)
+
+    const resources = readSidecar(storeDir).resources
+    expect(resources[getTranscriptResourceKey(locator("retired-oldest"))]?.state).toBe("retired")
+    expect(resources[getTranscriptResourceKey(locator("retired-newest"))]?.state).toBe("live")
+    expect(Object.values(resources).filter(resource =>
+      ["prepared", "retired", "deleting"].includes(resource.state))).toHaveLength(3)
+
+    await runGc([], bounded)
+    expect(deleted).toEqual([locator("retired-oldest").sessionId])
   })
 
   it("still enforces total ownership when passive retirement leaves pending capacity", async () => {
@@ -460,6 +499,69 @@ describe("session transcript lifecycle", () => {
     await acquireActiveTranscriptLease([fork], graceOptions)
     now += 50
     await expect(acquireActiveTranscriptLease([fork], graceOptions)).rejects.toThrow("active SDK writer")
+  })
+
+  it("releases a joined writer's lease on the next sweep when its lock is busy", async () => {
+    const fork = locator("joined-writer-busy-lock")
+    await prepareFork(fork, options)
+    const lease = await acquireActiveTranscriptLease([fork], options)
+    await abandonFork(fork, options)
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+
+    await releaseJoinedTranscriptLease(lease, { ...options, lockWaitMs: 3 })
+    rmSync(lock)
+    expect(readSidecar(storeDir).resources[getTranscriptResourceKey(fork)]?.activeLeases?.[lease.token])
+      .toBeDefined()
+
+    const deleted: string[] = []
+    await runGc([], { ...options, deleter: async (item) => { deleted.push(item.sessionId) } })
+    expect(deleted).toEqual(["joined-writer-busy-lock"])
+  })
+
+  it("still surfaces a joined writer's release failure that retrying cannot fix", async () => {
+    const fork = locator("joined-writer-corrupt")
+    await prepareFork(fork, options)
+    const lease = await acquireActiveTranscriptLease([fork], options)
+    writeFileSync(join(storeDir, "session-gc.json"), "{", { mode: 0o600 })
+
+    await expect(releaseJoinedTranscriptLease(lease, options))
+      .rejects.toBeInstanceOf(SessionLifecycleCorruptError)
+  })
+
+  it("keeps a non-recoverable writer lease fenced until the host reboots", async () => {
+    const current = captureProcessIncarnation()
+    if (!current) throw new Error("test process incarnation unavailable")
+    // Neither executor is running. Only the earlier boot proves that no
+    // descendant of the exited executor can still be writing its transcript.
+    const writers: Array<[TranscriptLocator, ProcessIncarnation]> = [
+      [locator("exited-writer-this-boot"), { ...current, pid: 999_999 }],
+      [locator("exited-writer-earlier-boot"), deadProcessIncarnation(999_998)],
+    ]
+    for (const [fork, executor] of writers) {
+      await prepareFork(fork, options)
+      const lease = await acquireActiveTranscriptLease([fork], options)
+      await attachActiveTranscriptExecutor(lease, executor, options, false)
+      await abandonFork(fork, options)
+    }
+
+    const deleted: string[] = []
+    const result = await runGc([], { ...options, deleter: async (item) => { deleted.push(item.sessionId) } })
+    expect(deleted).toEqual(["exited-writer-earlier-boot"])
+    expect(result.deferred).toBe(1)
+  })
+
+  it("pins a resource by its exact generation or by a generation-less legacy pin", async () => {
+    const target = locator("generation-pin")
+    await prepareFork(target, options)
+    await commitFork(target, options)
+    const stale = { ...target, lifecycleGeneration: `r:${getTranscriptResourceKey(target)}:999` }
+    const legacy = { ...target, lifecycleGeneration: undefined }
+
+    // The stale pin comes last so that it cannot shadow the other pin of its key.
+    expect((await reconcile([legacy, stale], options)).liveRetired).toBe(0)
+    expect((await reconcile([target, stale], options)).liveRetired).toBe(0)
+    expect((await reconcile([stale], options)).liveRetired).toBe(1)
   })
 
   it("retires an unpinned live resource once its stale publication lease expires", async () => {
@@ -765,6 +867,65 @@ describe("session transcript lifecycle", () => {
     })).rejects.toBeInstanceOf(SessionLifecycleLockError)
     expect(readdirSync(storeDir)).not.toContain("session-gc.json")
   })
+
+  it("initialises one lock candidate per acquisition, not one per retry", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+    const candidates = (): string[] =>
+      readdirSync(storeDir).filter((name) => name.includes(".candidate-"))
+    const candidate = await createInitializedSidecarLockCandidate(lock, "this-owner\n")
+    const [staging] = candidates()
+    if (!staging) throw new Error("lock candidate was not created")
+    // Failed publication keeps the same synced inode ready for the next link.
+    expect(await candidate.publish()).toBe(false)
+    expect(candidates()).toEqual([staging])
+    rmSync(lock)
+    expect(await candidate.publish()).toBe(true)
+    expect(candidates()).toEqual([staging])
+    expect(readFileSync(lock, "utf8")).toBe("this-owner\n")
+    await candidate.discard()
+    expect(candidates()).toEqual([])
+    expect(readFileSync(lock, "utf8")).toBe("this-owner\n")
+  })
+
+  it("grants the lock to one process's callers in arrival order", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+    chmodSync(lock, 0o600)
+    const order: string[] = []
+
+    // The earlier caller is asleep in a long retry interval when the holder
+    // leaves; a later caller polling fast would win a poll-only race.
+    const early = prepareFork(locator("early"), { ...options, lockRetryMs: 400 })
+      .then(() => { order.push("early") })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const late = prepareFork(locator("late"), { ...options, lockRetryMs: 5 })
+      .then(() => { order.push("late") })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    rmSync(lock, { force: true })
+
+    await Promise.all([early, late])
+    expect(order).toEqual(["early", "late"])
+  })
+
+  it("hands the turn on when a queued caller cancels admission", async () => {
+    const lock = join(storeDir, "session-gc.json.lock")
+    writeFileSync(lock, "another-owner\n", { mode: 0o600 })
+    chmodSync(lock, 0o600)
+
+    const first = prepareFork(locator("first"), options)
+    const controller = new AbortController()
+    const impatient = prepareFork(locator("impatient"), { ...options, admissionSignal: controller.signal })
+      .catch((error: unknown) => error)
+    const last = prepareFork(locator("last"), options)
+
+    controller.abort(new Error("queued admission cancelled"))
+    expect(await impatient).toEqual(new Error("queued admission cancelled"))
+    rmSync(lock, { force: true })
+    await Promise.all([first, last])
+    expect(Object.keys(readSidecar(storeDir).resources)).toHaveLength(2)
+  })
+
   it("never overlaps a second physical deleter with an uncertain first", async () => {
     const target = locator("lease-token")
     let now = 1_000
