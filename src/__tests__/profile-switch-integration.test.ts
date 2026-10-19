@@ -42,8 +42,11 @@ installModelsMock(() => ({
   resolveClaudeExecutableAsync: async () => "claude",
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, email: "test@test.com", subscriptionType: "max" }),
   getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
-  hasExtendedContext: () => false,
-  stripExtendedContext: (m: string) => m,
+  // Faithful to the real implementation — see profile-switch-inflight.test.ts;
+  // a bare `() => false` leaks into replay-budget.test.ts via bun's
+  // process-global mock.module. These tests only resolve "sonnet".
+  hasExtendedContext: (model: string) => model.endsWith("[1m]"),
+  stripExtendedContext: (model: string) => model.replace("[1m]", ""),
   isClosedControllerError: (e: unknown) => e instanceof Error && e.message.includes("controller is closed"),
   recordExtendedContextUnavailable: () => {},
   isExtendedContextKnownUnavailable: () => false,

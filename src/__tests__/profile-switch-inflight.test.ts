@@ -75,8 +75,13 @@ installModelsMock(() => ({
   resolveClaudeExecutableAsync: async () => "claude",
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, email: "test@test.com", subscriptionType: "max" }),
   getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
-  hasExtendedContext: () => false,
-  stripExtendedContext: (m: string) => m,
+  // Faithful to the real implementation: a bare `() => false` here leaks to
+  // later files through bun's process-global mock.module — replayBudget.ts
+  // imports hasExtendedContext and replay-budget.test.ts then computes 200k
+  // windows for [1m] models. These tests only ever resolve "sonnet", where
+  // the faithful answer is false anyway.
+  hasExtendedContext: (model: string) => model.endsWith("[1m]"),
+  stripExtendedContext: (model: string) => model.replace("[1m]", ""),
   isClosedControllerError: (e: unknown) => e instanceof Error && e.message.includes("controller is closed"),
   recordExtendedContextUnavailable: () => {},
   isExtendedContextKnownUnavailable: () => false,
