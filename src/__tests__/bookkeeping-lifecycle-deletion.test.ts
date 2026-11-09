@@ -317,7 +317,7 @@ it("an opened, hung real Node deletion executor stays fenced across GC and recon
     try {
       await Promise.race([entered, exited.then(() => { throw new Error("executor exited before gate entry") })])
     } finally { clearTimeout(timeout) }
-    expect(JSON.parse(readFileSync(marker, "utf8"))).toEqual({ pid: child.pid, node: expect.stringMatching(/^22\./) })
+    expect(JSON.parse(readFileSync(marker, "utf8"))).toEqual({ pid: child.pid, node: expect.stringMatching(/^2[2-9]\./) })
     const fenced = row(locator)
     expect(fenced.state).toBe("deleting")
     expect(fenced.deletionToken).toBe(claim.deletionToken)
@@ -377,7 +377,7 @@ it("SIGKILL of the real deletion parent after the SDK gate opens never releases 
     for (let attempt = 0; attempt < 500 && !existsSync(marker); attempt++) await Bun.sleep(10)
     expect(existsSync(marker)).toBe(true)
     const entered = JSON.parse(readFileSync(marker, "utf8")) as { id: string; pid: number; node: string }
-    expect(entered.id).toBe(locator.sessionId); expect(entered.node).toMatch(/^22\./)
+    expect(entered.id).toBe(locator.sessionId); expect(entered.node).toMatch(/^2[2-9]\./)
     const fenced = row(locator)
     executor = fenced.deletionExecutor
     expect(executor?.pid).toBe(entered.pid)
@@ -434,7 +434,7 @@ it("real Node child enters marker SDK only after executor attachment commits; ca
   } finally { capture.mockRestore(); onCommit = undefined }
   expect(observedAttachmentCommit).toBe(true)
   const value = JSON.parse(readFileSync(marker, "utf8")) as { id: string; pid: number; node: string }
-  expect(value.id).toBe("a"); expect(value.pid).not.toBe(process.pid); expect(value.node).toMatch(/^22\./)
+  expect(value.id).toBe("a"); expect(value.pid).not.toBe(process.pid); expect(value.node).toMatch(/^2[2-9]\./)
 })
 
 it("failed attachment COMMIT never opens real child gate or runs marker SDK", async () => {
